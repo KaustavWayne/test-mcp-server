@@ -1,13 +1,11 @@
 from fastmcp import FastMCP
 import os
-import sqlite3
+import aiosqlite
 import tempfile
 import json
 
-# Use writable temp directory (avoids read-only errors)
 TEMP_DIR = tempfile.gettempdir()
 DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
-
 CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
 
 print(f"Database path: {DB_PATH}")
@@ -15,47 +13,49 @@ print(f"Database path: {DB_PATH}")
 mcp = FastMCP("ExpenseTracker")
 
 
+# Keep initialization synchronous
 def init_db():
-    try:
-        with sqlite3.connect(DB_PATH) as c:
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("""
-                CREATE TABLE IF NOT EXISTS expenses(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    category TEXT NOT NULL,
-                    subcategory TEXT DEFAULT '',
-                    note TEXT DEFAULT ''
-                )
-            """)
-        print("Database initialized successfully")
-    except Exception as e:
-        print(f"Database initialization error: {e}")
-        raise
-
+    import sqlite3
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS expenses(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT DEFAULT '',
+                note TEXT DEFAULT ''
+            )
+        """)
 
 init_db()
 
 
 @mcp.tool()
-def add_expense(date, amount, category, subcategory="", note=""):
+async def add_expense(date, amount, category, subcategory="", note=""):
     """Add a new expense entry."""
+
     try:
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute(
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
                 "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
                 (date, amount, category, subcategory, note)
             )
-            c.commit()
-            return {"status": "ok", "id": cur.lastrowid}
+            await c.commit()
+
+            return {
+                "status": "ok",
+                "id": cur.lastrowid
+            }
+
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def edit_expense(id, date=None, amount=None, category=None, subcategory=None, note=None):
-    """Edit an existing expense entry by ID."""
+async def edit_expense(id, date=None, amount=None, category=None, subcategory=None, note=None):
+    """Edit an existing expense entry."""
 
     updates = []
     params = []
@@ -86,12 +86,13 @@ def edit_expense(id, date=None, amount=None, category=None, subcategory=None, no
     params.append(id)
 
     try:
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute(
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
                 f"UPDATE expenses SET {', '.join(updates)} WHERE id=?",
                 params
             )
-            c.commit()
+
+            await c.commit()
 
             if cur.rowcount == 0:
                 return {"status": "error", "message": "Expense not found"}
@@ -103,13 +104,17 @@ def edit_expense(id, date=None, amount=None, category=None, subcategory=None, no
 
 
 @mcp.tool()
-def delete_expense(id):
+async def delete_expense(id):
     """Delete an expense entry."""
 
     try:
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute("DELETE FROM expenses WHERE id=?", (id,))
-            c.commit()
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
+                "DELETE FROM expenses WHERE id=?",
+                (id,)
+            )
+
+            await c.commit()
 
             if cur.rowcount == 0:
                 return {"status": "error", "message": "Expense not found"}
@@ -121,12 +126,12 @@ def delete_expense(id):
 
 
 @mcp.tool()
-def list_expenses(start_date, end_date):
+async def list_expenses(start_date, end_date):
     """List expenses within date range."""
 
     try:
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute(
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
                 """
                 SELECT id, date, amount, category, subcategory, note
                 FROM expenses
@@ -136,37 +141,41 @@ def list_expenses(start_date, end_date):
                 (start_date, end_date)
             )
 
+            rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            return [dict(zip(cols, r)) for r in rows]
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def summarize(start_date, end_date, category=None):
+async def summarize(start_date, end_date, category=None):
     """Summarize expenses by category."""
 
+    query = """
+        SELECT category, SUM(amount) as total_amount, COUNT(*) as count
+        FROM expenses
+        WHERE date BETWEEN ? AND ?
+    """
+
+    params = [start_date, end_date]
+
+    if category:
+        query += " AND category=?"
+        params.append(category)
+
+    query += " GROUP BY category ORDER BY total_amount DESC"
+
     try:
-        query = """
-            SELECT category, SUM(amount) as total_amount, COUNT(*) as count
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-        """
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(query, params)
 
-        params = [start_date, end_date]
-
-        if category:
-            query += " AND category=?"
-            params.append(category)
-
-        query += " GROUP BY category ORDER BY total_amount DESC"
-
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute(query, params)
-
+            rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            return [dict(zip(cols, r)) for r in rows]
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
